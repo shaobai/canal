@@ -106,8 +106,8 @@ public class MysqlMultiStageCoprocessor extends AbstractCanalLifeCycle implement
 
         // stage 3
         SequenceBarrier dmlParserSequenceBarrier = disruptorMsgBuffer.newBarrier(simpleParserStage.getSequence());
-        WorkHandler<MessageEvent>[] workHandlers = new DmlParserStage[parserThreadCount];
-        for (int i = 0; i < parserThreadCount; i++) {
+        WorkHandler<MessageEvent>[] workHandlers = new DmlParserStage[tc];
+        for (int i = 0; i < tc; i++) {
             workHandlers[i] = new DmlParserStage();
         }
         workerPool = new WorkerPool<MessageEvent>(disruptorMsgBuffer,
@@ -275,6 +275,7 @@ public class MysqlMultiStageCoprocessor extends AbstractCanalLifeCycle implement
                         needDmlParse = true;
                         break;
                     case LogEvent.UPDATE_ROWS_EVENT_V1:
+                    case LogEvent.PARTIAL_UPDATE_ROWS_EVENT:
                     case LogEvent.UPDATE_ROWS_EVENT:
                         tableMeta = logEventConvert.parseRowsEventForTableMeta((UpdateRowsLogEvent) logEvent);
                         needDmlParse = true;
@@ -440,6 +441,8 @@ public class MysqlMultiStageCoprocessor extends AbstractCanalLifeCycle implement
 
         @Override
         public void handleEventException(final Throwable ex, final long sequence, final Object event) {
+            //异常上抛，否则processEvents的逻辑会默认会mark为成功执行，有丢数据风险
+            throw new CanalParseException(ex);
         }
 
         @Override

@@ -2,15 +2,18 @@ package com.alibaba.otter.canal.deployer;
 
 import java.io.FileInputStream;
 import java.util.Properties;
+import java.util.concurrent.CountDownLatch;
 
+import com.alibaba.otter.canal.deployer.mbean.CanalServerAgent;
+import com.alibaba.otter.canal.deployer.mbean.CanalServerMXBean;
+import com.alibaba.otter.canal.deployer.mbean.CanalServerBean;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.alibaba.otter.canal.kafka.CanalKafkaProducer;
-import com.alibaba.otter.canal.rocketmq.CanalRocketMQProducer;
-import com.alibaba.otter.canal.server.CanalMQStarter;
-import com.alibaba.otter.canal.spi.CanalMQProducer;
+import com.alibaba.otter.canal.deployer.monitor.remote.RemoteConfigLoader;
+import com.alibaba.otter.canal.deployer.monitor.remote.RemoteConfigLoaderFactory;
+import com.alibaba.otter.canal.deployer.monitor.remote.RemoteCanalConfigMonitor;
 
 /**
  * canal独立版本启动的入口类
@@ -20,10 +23,11 @@ import com.alibaba.otter.canal.spi.CanalMQProducer;
  */
 public class CanalLauncher {
 
-    private static final String CLASSPATH_URL_PREFIX = "classpath:";
-    private static final Logger logger               = LoggerFactory.getLogger(CanalLauncher.class);
+    private static final String        CLASSPATH_URL_PREFIX = "classpath:";
+    private static final Logger        logger               = LoggerFactory.getLogger(CanalLauncher.class);
+    public static final CountDownLatch runningLatch         = new CountDownLatch(1);
 
-    public static void main(String[] args) throws Throwable {
+    public static void main(String[] args) {
         try {
             logger.info("## set default uncaught exception handler");
             setGlobalUncaughtExceptionHandler();
@@ -31,6 +35,7 @@ public class CanalLauncher {
             logger.info("## load canal configurations");
             String conf = System.getProperty("canal.conf", "classpath:canal.properties");
             Properties properties = new Properties();
+            RemoteConfigLoader remoteConfigLoader = null;
             if (conf.startsWith(CLASSPATH_URL_PREFIX)) {
                 conf = StringUtils.substringAfter(conf, CLASSPATH_URL_PREFIX);
                 properties.load(CanalLauncher.class.getClassLoader().getResourceAsStream(conf));
@@ -38,47 +43,60 @@ public class CanalLauncher {
                 properties.load(new FileInputStream(conf));
             }
 
-            CanalMQProducer canalMQProducer = null;
-            String serverMode = CanalController.getProperty(properties, CanalConstants.CANAL_SERVER_MODE);
-            if (serverMode.equalsIgnoreCase("kafka")) {
-                canalMQProducer = new CanalKafkaProducer();
-            } else if (serverMode.equalsIgnoreCase("rocketmq")) {
-                canalMQProducer = new CanalRocketMQProducer();
+            remoteConfigLoader = RemoteConfigLoaderFactory.getRemoteConfigLoader(properties);
+            if (remoteConfigLoader != null) {
+                // 加载远程canal.properties
+                Properties remoteConfig = remoteConfigLoader.loadRemoteConfig();
+                // 加载remote instance配置
+                remoteConfigLoader.loadRemoteInstanceConfigs();
+                if (remoteConfig != null) {
+                    properties = remoteConfig;
+                } else {
+                    remoteConfigLoader = null;
+                }
             }
 
-            if (canalMQProducer != null) {
-                // disable netty
-                System.setProperty(CanalConstants.CANAL_WITHOUT_NETTY, "true");
-            }
+            final CanalStater canalStater = new CanalStater(properties);
+            canalStater.start();
 
-            logger.info("## start the canal server.");
-            final CanalController controller = new CanalController(properties);
-            controller.start();
-            logger.info("## the canal server is running now ......");
-            Runtime.getRuntime().addShutdownHook(new Thread() {
+            if (remoteConfigLoader != null) {
+                remoteConfigLoader.startMonitor(new RemoteCanalConfigMonitor() {
 
-                public void run() {
-                    try {
-                        logger.info("## stop the canal server");
-                        controller.stop();
-                    } catch (Throwable e) {
-                        logger.warn("##something goes wrong when stopping canal Server:", e);
-                    } finally {
-                        logger.info("## canal server is down.");
+                    @Override
+                    public void onChange(Properties properties) {
+                        try {
+                            // 远程配置canal.properties修改重新加载整个应用
+                            canalStater.stop();
+                            canalStater.setProperties(properties);
+                            canalStater.start();
+                        } catch (Throwable throwable) {
+                            logger.error(throwable.getMessage(), throwable);
+                        }
                     }
-                }
+                });
+            }
 
-            });
+            CanalServerAgent canalServerAgent = null;
+            String jmxPort = properties.getProperty(CanalConstants.CANAL_ADMIN_JMX_PORT);
+            if (StringUtils.isNotEmpty(jmxPort)) {
+                String ip = properties.getProperty(CanalConstants.CANAL_IP);
+                CanalServerMXBean canalServerMBean = new CanalServerBean(canalStater);
+                canalServerAgent = new CanalServerAgent(ip, Integer.parseInt(jmxPort), canalServerMBean);
+                Thread agentThread = new Thread(canalServerAgent::start);
+                agentThread.start();
+            }
 
-            if (canalMQProducer != null) {
-                CanalMQStarter canalServerStarter = new CanalMQStarter(canalMQProducer);
-                if (canalServerStarter != null) {
-                    canalServerStarter.init();
-                }
+            runningLatch.await();
+
+            if (canalServerAgent != null) {
+                canalServerAgent.stop();
+            }
+
+            if (remoteConfigLoader != null) {
+                remoteConfigLoader.destroy();
             }
         } catch (Throwable e) {
             logger.error("## Something goes wrong when starting up the canal Server:", e);
-            System.exit(0);
         }
     }
 
@@ -91,4 +109,5 @@ public class CanalLauncher {
             }
         });
     }
+
 }

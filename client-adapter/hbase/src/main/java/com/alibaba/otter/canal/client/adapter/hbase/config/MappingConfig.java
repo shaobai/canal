@@ -1,5 +1,7 @@
 package com.alibaba.otter.canal.client.adapter.hbase.config;
 
+import com.alibaba.otter.canal.client.adapter.support.AdapterConfig;
+
 import java.util.*;
 
 /**
@@ -8,11 +10,17 @@ import java.util.*;
  * @author rewerma 2018-8-21 下午06:45:49
  * @version 1.0.0
  */
-public class MappingConfig {
+public class MappingConfig implements AdapterConfig {
 
-    private String       dataSourceKey; // 数据源key
+    private String       dataSourceKey;   // 数据源key
 
-    private HbaseMapping hbaseMapping;  // hbase映射配置
+    private String       outerAdapterKey; // adapter key
+
+    private String       groupId;         // groupId
+
+    private String       destination;     // canal实例或MQ的topic
+
+    private HbaseMapping hbaseMapping;    // hbase映射配置
 
     public String getDataSourceKey() {
         return dataSourceKey;
@@ -22,12 +30,40 @@ public class MappingConfig {
         this.dataSourceKey = dataSourceKey;
     }
 
+    public String getGroupId() {
+        return groupId;
+    }
+
+    public void setGroupId(String groupId) {
+        this.groupId = groupId;
+    }
+
+    public String getOuterAdapterKey() {
+        return outerAdapterKey;
+    }
+
+    public void setOuterAdapterKey(String outerAdapterKey) {
+        this.outerAdapterKey = outerAdapterKey;
+    }
+
+    public String getDestination() {
+        return destination;
+    }
+
+    public void setDestination(String destination) {
+        this.destination = destination;
+    }
+
     public HbaseMapping getHbaseMapping() {
         return hbaseMapping;
     }
 
     public void setHbaseMapping(HbaseMapping hbaseMapping) {
         this.hbaseMapping = hbaseMapping;
+    }
+
+    public AdapterMapping getMapping() {
+        return hbaseMapping;
     }
 
     public void validate() {
@@ -66,6 +102,7 @@ public class MappingConfig {
     public static class ColumnItem {
 
         private boolean isRowKey = false;
+        private Integer rowKeyLen;
         private String  column;
         private String  family;
         private String  qualifier;
@@ -77,6 +114,14 @@ public class MappingConfig {
 
         public void setRowKey(boolean rowKey) {
             isRowKey = rowKey;
+        }
+
+        public Integer getRowKeyLen() {
+            return rowKeyLen;
+        }
+
+        public void setRowKeyLen(Integer rowKeyLen) {
+            this.rowKeyLen = rowKeyLen;
         }
 
         public String getColumn() {
@@ -140,10 +185,9 @@ public class MappingConfig {
         }
     }
 
-    public static class HbaseMapping {
+    public static class HbaseMapping implements AdapterMapping {
 
         private Mode                    mode               = Mode.STRING;           // hbase默认转换格式
-        private String                  destination;                                // canal实例或MQ的topic
         private String                  database;                                   // 数据库名或schema名
         private String                  table;                                      // 表面名
         private String                  hbaseTable;                                 // hbase表名
@@ -167,14 +211,6 @@ public class MappingConfig {
 
         public void setMode(Mode mode) {
             this.mode = mode;
-        }
-
-        public String getDestination() {
-            return destination;
-        }
-
-        public void setDestination(String destination) {
-            this.destination = destination;
         }
 
         public String getDatabase() {
@@ -263,7 +299,16 @@ public class MappingConfig {
                     ColumnItem columnItem = new ColumnItem();
                     columnItem.setColumn(columnField.getKey());
                     columnItem.setType(type);
-                    if ("rowKey".equalsIgnoreCase(field)) {
+                    if (field != null && field.toUpperCase().startsWith("ROWKEY")) {
+                        int idx = field.toUpperCase().indexOf("LEN:");
+                        if (idx > -1) {
+                            String len = field.substring(idx + 4);
+                            try {
+                                columnItem.setRowKeyLen(Integer.parseInt(len));
+                            } catch (Exception e) {
+                                // ignore
+                            }
+                        }
                         columnItem.setRowKey(true);
                         rowKeyColumn = columnItem;
                     } else {

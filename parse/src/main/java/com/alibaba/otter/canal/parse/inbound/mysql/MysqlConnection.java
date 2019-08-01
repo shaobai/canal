@@ -20,6 +20,7 @@ import com.alibaba.otter.canal.parse.driver.mysql.MysqlQueryExecutor;
 import com.alibaba.otter.canal.parse.driver.mysql.MysqlUpdateExecutor;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.GTIDSet;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.HeaderPacket;
+import com.alibaba.otter.canal.parse.driver.mysql.packets.MysqlGTIDSet;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.BinlogDumpCommandPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.BinlogDumpGTIDCommandPacket;
 import com.alibaba.otter.canal.parse.driver.mysql.packets.client.RegisterSlaveCommandPacket;
@@ -118,7 +119,7 @@ public class MysqlConnection implements ErosaConnection {
     /**
      * 加速主备切换时的查找速度，做一些特殊优化，比如只解析事务头或者尾
      */
-    public void seek(String binlogfilename, Long binlogPosition, SinkFunction func) throws IOException {
+    public void seek(String binlogfilename, Long binlogPosition, String gtid, SinkFunction func) throws IOException {
         updateSettings();
         loadBinlogChecksum();
         sendBinlogDump(binlogfilename, binlogPosition);
@@ -130,6 +131,15 @@ public class MysqlConnection implements ErosaConnection {
         decoder.handle(LogEvent.QUERY_EVENT);
         decoder.handle(LogEvent.XID_EVENT);
         LogContext context = new LogContext();
+        // 若entry position存在gtid，则使用传入的gtid作为gtidSet
+        // 拼接的标准,否则同时开启gtid和tsdb时，会导致丢失gtid
+        // 而当源端数据库gtid 有purged时会有如下类似报错
+        // 'errno = 1236, sqlstate = HY000 errmsg = The slave is connecting
+        // using CHANGE MASTER TO MASTER_AUTO_POSITION = 1 ...
+        if (StringUtils.isNotEmpty(gtid)) {
+            decoder.handle(LogEvent.GTID_LOG_EVENT);
+            context.setGtidSet(MysqlGTIDSet.parse(gtid));
+        }
         context.setFormatDescription(new FormatDescriptionLogEvent(4, binlogChecksum));
         while (fetcher.fetch()) {
             accumulateReceivedBytes(fetcher.limit());
@@ -406,9 +416,12 @@ public class MysqlConnection implements ErosaConnection {
             // 如果不设置会出现错误： Slave can not handle replication events with the
             // checksum that master is configured to log
             // 但也不能乱设置，需要和mysql server的checksum配置一致，不然RotateLogEvent会出现乱码
-            update("set @master_binlog_checksum= '@@global.binlog_checksum'");
+            // '@@global.binlog_checksum'需要去掉单引号,在mysql 5.6.29下导致master退出
+            update("set @master_binlog_checksum= @@global.binlog_checksum");
         } catch (Exception e) {
-            logger.warn("update master_binlog_checksum failed", e);
+            if (!StringUtils.contains(e.getMessage(), "Unknown system variable")) {
+                logger.warn("update master_binlog_checksum failed", e);
+            }
         }
 
         try {
@@ -425,7 +438,9 @@ public class MysqlConnection implements ErosaConnection {
             // mariadb针对特殊的类型，需要设置session变量
             update("SET @mariadb_slave_capability='" + LogEvent.MARIA_SLAVE_CAPABILITY_MINE + "'");
         } catch (Exception e) {
-            logger.warn("update mariadb_slave_capability failed", e);
+            if (!StringUtils.contains(e.getMessage(), "Unknown system variable")) {
+                logger.warn("update mariadb_slave_capability failed", e);
+            }
         }
 
         /**
@@ -502,40 +517,19 @@ public class MysqlConnection implements ErosaConnection {
      * </pre>
      */
     private void loadBinlogChecksum() {
-        if (checkMariaDB()) {
-            ResultSetPacket rs = null;
-            try {
-                rs = query("select @@global.binlog_checksum");
-            } catch (IOException e) {
-                throw new CanalParseException(e);
-            }
-
+        ResultSetPacket rs = null;
+        try {
+            rs = query("select @@global.binlog_checksum");
             List<String> columnValues = rs.getFieldValues();
-            if (columnValues != null && columnValues.size() >= 1 && columnValues.get(0).toUpperCase().equals("CRC32")) {
+            if (columnValues != null && columnValues.size() >= 1 && columnValues.get(0) != null && columnValues.get(0).toUpperCase().equals("CRC32")) {
                 binlogChecksum = LogEvent.BINLOG_CHECKSUM_ALG_CRC32;
             } else {
                 binlogChecksum = LogEvent.BINLOG_CHECKSUM_ALG_OFF;
             }
+        } catch (Throwable e) {
+            logger.error("", e);
+            binlogChecksum = LogEvent.BINLOG_CHECKSUM_ALG_OFF;
         }
-    }
-
-    /**
-     * 获取是否为mariadb
-     */
-    private boolean checkMariaDB() {
-        ResultSetPacket rs = null;
-        try {
-            rs = query("SELECT @@version");
-        } catch (IOException e) {
-            throw new CanalParseException(e);
-        }
-
-        List<String> columnValues = rs.getFieldValues();
-        if (columnValues != null && columnValues.size() >= 1) {
-            return StringUtils.containsIgnoreCase(columnValues.get(0), "MariaDB");
-        }
-
-        return false;
     }
 
     private void accumulateReceivedBytes(long x) {
